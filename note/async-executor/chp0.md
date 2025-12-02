@@ -36,6 +36,8 @@ pub fn spawn<T: Send + 'a>(&self, future: impl Future<Output = T> + Send + 'a) -
 }
 ```
 
+`spwan`: 调用 `spwan_inner`
+
 #### 2.1 `spawn_inner`
 
 ```rust
@@ -59,7 +61,15 @@ unsafe fn spawn_inner<T: 'a>(
 }
 ```
 
-### 3. 调度闭包 (`schedule`)
+- `spawn_inner`
+  - 在 `active` (Slab) 注册，获取一个空闲的东西
+  - `AsyncCallOnDrop` 封装，确保 async 代码块会被销毁
+  - `async_task::Builder` 创建 `Runnable` 和 `Task`,分别给用户和任务队列
+  - `.spawn_unchecked` 触发 schedule 函数生成闭包
+  - `runnable.schedule()` 触发闭包，然后入队。
+- **`schedule`**：生成闭包 `move |runnable| { state.queue.push(runnable); state.notify(); }`。
+
+调度闭包 (`schedule`)
 
 调用的 `Self::schedule` 如下：
 
@@ -90,27 +100,149 @@ fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
 +-----------------------+
 ```
 
-### 5. 最终总结 (原封不动)
-
 `spawn` 做的事情是调用底层的 `spawn_inner`，创建任务，也就是我们的代码块，同事创建了 `callback` 函数，通过最后的 `.schedule` 把任务放进队列里面。
 
-### 总结
+### `state()` 转换 把 AtomicPtr<State> 变为 Pin<&State>
 
-#### `Executor` 结构体
+```rust
+unsafe fn spawn_inner<T: 'a>(
+        state: Pin<&'a State>,
+        future: impl Future<Output = T> + 'a,
+        active: &mut Slab<Waker>,
+) -> Task<T> {}
 
-用来管理任务和执行任务
+fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {}
+
+pub fn spawn<T: Send + 'a>(&self, future: impl Future<Output = T> + Send + 'a) -> Task<T> {
+        let state: Pin<&State> = self.state();
+    let mut active = state.active();
+    ///
+}
+```
+
+spawn_inner 和 schedul 的参数要求是 Pin<&'a State>类型的，但是我们成员 State 是 pub(crate) state: AtomicPtr<State> ，
+
+需要转换类型才能调用 State 结构体的方法 `.acticve` 等
+
+### tick and try_tick ，实际的定义在 State 结构体中
+
+```rust
+    pub(crate) fn try_tick(&self) -> bool {
+        match self.queue.pop() {
+            Err(_) => false,
+            Ok(runnable) => {
+                // Notify another ticker now to pick up where this ticker left off, just in case
+                // running the task takes a long time.
+                self.notify();
+
+                // Run the task.
+                runnable.run();
+                true
+            }
+        }
+    }
+
+    pub(crate) async fn tick(&self) {
+        let runnable = Ticker::new(self).runnable().await;
+        runnable.run();
+    }
+```
+
+try_tick 在拿到任务后会会 notify 别的线程，如果没有会跳过返回 false，如果有就执行，返回真
+
+tick 启动后如果任务队列是空的，会卡在这里 ，返回一个 Peding，直到有任务，有别的把他 noftify。异步等待
+
+### `spwan_many`
+
+```rust
+pub fn spawn_many<T: 'a, F: Future<Output = T> + 'a>(
+        &self,
+        futures: impl IntoIterator<Item = F>,
+        handles: &mut impl Extend<Task<F::Output>>,
+    ) {
+        let state = self.inner().state();
+        let mut active = state.active();
+
+        // Convert all of the futures to tasks.
+        let tasks = futures.into_iter().map(|future| {
+            // SAFETY: This executor is not thread safe, so the future and its result
+            //         cannot be sent to another thread.
+            unsafe { Executor::spawn_inner(state, future, &mut active) }
+
+            // As only one thread can spawn or poll tasks at a time, there is no need
+            // to release lock contention here.
+        });
+
+        // Push them to the user's collection.
+        handles.extend(tasks);
+    }
+```
+
+`active: Mutex<Slab<Waker>>` ，获取 actice 的锁 ，这样可以朝着 Waker 队列写东西
+
+unsafe 中调用 spawn_inner 创见任务
+
+在 handles 中添加创见的任务
 
 #### 方法
 
-- `spwan`: 调用 `spwan_inner`
-- `spawn_inner`
-  - 在 `active` (Slab) 注册，获取一个空闲的东西
-  - `AsyncCallOnDrop` 封装，确保 async 代码块会被销毁
-  - `async_task::Builder` 创建 `Runnable` 和 `Task`,分别给用户和任务队列
-  - `.spawn_unchecked` 触发 schedule 函数生成闭包
-  - `runnable.schedule()` 触发闭包，然后入队。
-- **`schedule`**：生成闭包 `move |runnable| { state.queue.push(runnable); state.notify(); }`。
 - **`run`**：调用 `self.state().run(future).await`。
+- `state`:
+
+```rust
+impl <'a> Executor<'a> {
+    pub const fn new () -> Executor<'a>;
+    pub fn is_empty (&self) -> bool;
+    pub fn spawn <T: Send + 'a> (&self, future: impl Future<Output = T> + Send + 'a) -> Task<T>;
+    pub fn spawn_many <T: Send + 'a, F: Future<Output = T> + Send + 'a> ( &self, futures: impl IntoIterator<Item = F>, handles: &mut impl Extend<Task<F::Output>>, );
+    unsafe fn spawn_inner <T: 'a> ( state: Pin<&'a State>, future: impl Future<Output = T> + 'a, active: &mut Slab<Waker>, ) -> Task<T>;
+    pub fn try_tick (&self) -> bool;
+    pub async fn tick (&self);
+    pub async fn run <T> (&self, future: impl Future<Output = T>) -> T;
+    fn schedule (state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a;
+    fn state (&self) -> Pin<&'a State>;
+}
+```
+
+上面有大量的调用 state 内部的方法，
+
+## `State` 和 `Sleepers`
+
+```rust
+struct State {
+    queue : ConcurrentQueue<Runnable>,           // 全局任务队列
+    local_queues : RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>, // 本地队列
+    notified : AtomicBool,                       // 简单的信号灯
+    sleepers : Mutex<Sleepers>,                  // 睡觉的线程名单
+    active : Mutex<Slab<Waker>>                  // 正在运行的任务的 Waker
+}
+
+impl State {
+    const fn new () -> State;
+    fn pin (&self) -> Pin<&Self>;
+    fn active (self: Pin<&Self>) -> MutexGuard<'_, Slab<Waker>>;
+    fn notify (&self);
+    pub(crate) fn try_tick (&self) -> bool;
+    pub(crate) async fn tick (&self);
+    pub async fn run <T> (&self, future: impl Future<Output = T>) -> T;
+}
+
+struct Sleepers {
+    count : usize,
+    wakers : Vec<(usize, Waker)>,
+    free_ids : Vec<usize>
+}
+
+impl Sleepers {
+    fn insert (&mut self, waker: &Waker) -> usize;
+    fn update (&mut self, id: usize, waker: &Waker) -> bool;
+    fn remove (&mut self, id: usize) -> bool;
+    fn is_notified (&self) -> bool;
+    fn notify (&mut self) -> Option<Waker>;
+}
+```
+
+## `LocalExecutor`
 
 ```rust
 
@@ -156,15 +288,12 @@ sd
 
 ```rust
 
-```
-
-```rust
 
 ```
 
 ## 附录：问题列表
 
-```markdown
+````markdown
 1.active: &mut Slab<Waker>
 是一堆的 waker 开关吗？也就是比如有 10 个 waker 开关
 
@@ -200,9 +329,7 @@ mem::forget(self);
             ((*header).vtable.schedule)(ptr, ScheduleInfo::new(false));
         }
     }
-```
 
-````markdown
 1.  这是 executor 的 fn run
 
 ```rust
@@ -214,7 +341,7 @@ mem::forget(self);
 
 sd 2.这是 executor 的 schedule 刚才用的是 runnable 的 schedule 还是这个，这个是干嘛的
 
-```rust
+`````rust
 fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
         // TODO: If possible, push into the current local queue and notify the ticker.
         move |runnable| {
@@ -223,9 +350,6 @@ fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
             state.notify();
         }
     }
-```
-
-`````markdown
 1.  这是 executor 的 fn run
 
 ```rust
@@ -248,8 +372,5 @@ fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
     ```
 
 ````
+
 `````
-
-```
-
-```

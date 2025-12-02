@@ -163,7 +163,7 @@ impl<'a> Executor<'a> {
     /// });
     /// ```
     pub fn spawn<T: Send + 'a>(&self, future: impl Future<Output = T> + Send + 'a) -> Task<T> {
-        let state = self.state();
+        let state: Pin<&State> = self.state();
         let mut active = state.active();
 
         // SAFETY: `T` and the future are `Send`.
