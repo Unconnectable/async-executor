@@ -56,7 +56,7 @@ unsafe fn spawn_inner<T: 'a>(
         .spawn_unchecked(|()| future, Self::schedule(state)); // Self::schedule 生成闭包
     entry.insert(runnable.waker());
 
-    runnable.schedule(); // 调用生成的闭包，入队
+    runnable.schedule(); // 调用生成的闭包,入队
     task
 }
 ```
@@ -71,16 +71,16 @@ unsafe fn spawn_inner<T: 'a>(
 
 调度闭包 (`schedule`)
 
-调用的 `Self::schedule` 如下：
+调用的 `Self::schedule` 如下:
 
 ```rust
 fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
     // TODO: If possible, push into the current local queue and notify the ticker.
     move |runnable| {
-        // 具体的动作：把任务放进队列
+        // 具体的动作:把任务放进队列
         let result = state.queue.push(runnable);
         debug_assert!(result.is_ok()); // Since we use unbounded queue, push will never fail.
-        // 通知执行器有新活了，别睡了
+        // 通知执行器有新活了,别睡了
         state.notify();
     }
 }
@@ -100,7 +100,7 @@ fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
 +-----------------------+
 ```
 
-`spawn` 做的事情是调用底层的 `spawn_inner`，创建任务，也就是我们的代码块，同事创建了 `callback` 函数，通过最后的 `.schedule` 把任务放进队列里面。
+`spawn` 做的事情是调用底层的 `spawn_inner`,创建任务,也就是我们的代码块,同事创建了 `callback` 函数,通过最后的 `.schedule` 把任务放进队列里面.
 
 ### `state()` 转换 把 AtomicPtr<State> 变为 Pin<&State>
 
@@ -186,63 +186,15 @@ unsafe 中调用 spawn_inner 创见任务
 
 #### 方法
 
-- **`run`**：调用 `self.state().run(future).await`。
-- `state`:
-
-```rust
-impl <'a> Executor<'a> {
-    pub const fn new () -> Executor<'a>;
-    pub fn is_empty (&self) -> bool;
-    pub fn spawn <T: Send + 'a> (&self, future: impl Future<Output = T> + Send + 'a) -> Task<T>;
-    pub fn spawn_many <T: Send + 'a, F: Future<Output = T> + Send + 'a> ( &self, futures: impl IntoIterator<Item = F>, handles: &mut impl Extend<Task<F::Output>>, );
-    unsafe fn spawn_inner <T: 'a> ( state: Pin<&'a State>, future: impl Future<Output = T> + 'a, active: &mut Slab<Waker>, ) -> Task<T>;
-    pub fn try_tick (&self) -> bool;
-    pub async fn tick (&self);
-    pub async fn run <T> (&self, future: impl Future<Output = T>) -> T;
-    fn schedule (state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a;
-    fn state (&self) -> Pin<&'a State>;
-}
-```
-
-上面有大量的调用 state 内部的方法，
-
-## `State` 和 `Sleepers`
-
-```rust
-struct State {
-    queue : ConcurrentQueue<Runnable>,           // 全局任务队列
-    local_queues : RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>, // 本地队列
-    notified : AtomicBool,                       // 简单的信号灯
-    sleepers : Mutex<Sleepers>,                  // 睡觉的线程名单
-    active : Mutex<Slab<Waker>>                  // 正在运行的任务的 Waker
-}
-
-impl State {
-    const fn new () -> State;
-    fn pin (&self) -> Pin<&Self>;
-    fn active (self: Pin<&Self>) -> MutexGuard<'_, Slab<Waker>>;
-    fn notify (&self);
-    pub(crate) fn try_tick (&self) -> bool;
-    pub(crate) async fn tick (&self);
-    pub async fn run <T> (&self, future: impl Future<Output = T>) -> T;
-}
-
-struct Sleepers {
-    count : usize,
-    wakers : Vec<(usize, Waker)>,
-    free_ids : Vec<usize>
-}
-
-impl Sleepers {
-    fn insert (&mut self, waker: &Waker) -> usize;
-    fn update (&mut self, id: usize, waker: &Waker) -> bool;
-    fn remove (&mut self, id: usize) -> bool;
-    fn is_notified (&self) -> bool;
-    fn notify (&mut self) -> Option<Waker>;
-}
-```
-
-## `LocalExecutor`
+- `spwan`: 调用 `spwan_inner`
+- `spawn_inner`
+  - 在 `active` (Slab) 注册,获取一个空闲的东西
+  - `AsyncCallOnDrop` 封装,确保 async 代码块会被销毁
+  - `async_task::Builder` 创建 `Runnable` 和 `Task`,分别给用户和任务队列
+  - `.spawn_unchecked` 触发 schedule 函数生成闭包
+  - `runnable.schedule()` 触发闭包,然后入队.
+- **`schedule`**:生成闭包 `move |runnable| { state.queue.push(runnable); state.notify(); }`.
+- **`run`**:调用 `self.state().run(future).await`.
 
 ```rust
 
@@ -291,25 +243,25 @@ sd
 
 ```
 
-## 附录：问题列表
+## 附录:问题列表
 
 ````markdown
 1.active: &mut Slab<Waker>
-是一堆的 waker 开关吗？也就是比如有 10 个 waker 开关
+是一堆的 waker 开关吗?也就是比如有 10 个 waker 开关
 
 let entry = active.vacant_entry(); // 在花名册里找个空位
 let index = entry.key(); // 拿到这个空位的号码牌 (ID)
 
-这里是随机找一个吗 比如我的 10 个 waker 有 5 个空的，就随便找一个 如果没有空的了？会扩容吗？
+这里是随机找一个吗 比如我的 10 个 waker 有 5 个空的,就随便找一个 如果没有空的了?会扩容吗?
 entry.key 是获取这个空的的号码吗 比如 5 号 10 号
 
 2.  let future = AsyncCallOnDrop::new(future, move || drop(state.active().try_remove(index)));
-    这里就是把我的外部的代码告诉系统 出现 panic！或者别的错误就结束
+    这里就是把我的外部的代码告诉系统 出现 panic!或者别的错误就结束
 
 也就是 fn async{ xxx} 或者 async {
 do something
 }
-这样的吗？
+这样的吗?
 
 3.  let (runnable, task) = Builder::new()
     .propagate_panic(true)
@@ -339,7 +291,7 @@ mem::forget(self);
 ```
 ````
 
-sd 2.这是 executor 的 schedule 刚才用的是 runnable 的 schedule 还是这个，这个是干嘛的
+sd 2.这是 executor 的 schedule 刚才用的是 runnable 的 schedule 还是这个,这个是干嘛的
 
 `````rust
 fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
@@ -358,7 +310,7 @@ fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
     }
 ```
 
-2.这是 executor 的 schedule 刚才用的是 runnable 的 schedule 还是这个，这个是干嘛的
+2.这是 executor 的 schedule 刚才用的是 runnable 的 schedule 还是这个,这个是干嘛的
 
 ````rust
 fn schedule(state: Pin<&'a State>) -> impl Fn(Runnable) + Send + Sync + 'a {
